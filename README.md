@@ -216,8 +216,10 @@ Response: { "ok": true }
 
 ### Upload de arquivos
 
+- Variantes de tamanho podem ser geradas automaticamente para imagens enviadas utilizando os parâmetros `small`, `medium` e `large`.
+
 ```bash
-curl -X POST "http://localhost:8000/api/assets/upload?folder=produtos/2025" \
+curl -X POST "http://localhost:8000/api/assets/upload?folder=produtos/2025&small=1&medium=300x400" \
   -H "Authorization: Bearer $TOKEN" \
   -F "files[]=@/caminho/foto1.png" \
   -F "files[]=@/caminho/foto2.jpg"
@@ -225,6 +227,9 @@ curl -X POST "http://localhost:8000/api/assets/upload?folder=produtos/2025" \
 
 - Parâmetro opcional `folder` sanitizado por regex (`^[a-zA-Z0-9/_-]+$`).
 - `files[]` aceita múltiplos arquivos (máximo configurável via `ASSETS_MAX_FILE_SIZE`).
+- `small|medium|large` são opcionais. Use `1` para aplicar o tamanho padrão do `config/assetsme.php`, `LARGURAxALTURA` para definir um tamanho customizado (ex.: `800x600`) ou omita/defina como `0` para não gerar a variação.
+- Valores que excedem `ASSETS_MAX_WIDTH`/`ASSETS_MAX_HEIGHT` ou não seguem o formato válido retornam HTTP 422.
+- Arquivos variantes são salvos com o sufixo `--<tamanho>` e suas URLs aparecem na chave `sizes` da resposta JSON quando geradas.
 - A resposta retorna metadados: URL pública, caminho, MIME detectado por `finfo`, tamanho, nome original e checksum SHA-256.
 
 ### Listagem de assets

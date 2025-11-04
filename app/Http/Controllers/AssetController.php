@@ -2,9 +2,9 @@
 
 namespace App\Http\Controllers;
 
+use App\Features\Convert\ImageResize;
 use App\Models\Asset;
 use App\Models\Folder;
-use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Filesystem\FilesystemAdapter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -13,6 +13,7 @@ use Illuminate\Pagination\Paginator;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Symfony\Component\HttpFoundation\Response;
 
 class AssetController extends Controller
@@ -37,7 +38,8 @@ class AssetController extends Controller
             $request->all(),
             [
                 'folder' => ['nullable', 'string', 'regex:/^[a-zA-Z0-9_\\/\-]+$/'],
-                'files' => ['required', 'array', 'min:1'],
+                'file' => ['nullable', 'file', 'max:'.$maxKilobytes],
+                'files' => ['nullable', 'array'],
                 'files.*' => ['file', 'max:'.$maxKilobytes],
             ],
             [
@@ -61,18 +63,47 @@ class AssetController extends Controller
         // Resolve folder ID from folder path
         $folderId = $this->resolveFolderId($folder, $userId);
 
-        $uploadedFiles = $request->file('files', []);
-        if (! is_array($uploadedFiles)) {
-            $uploadedFiles = [$uploadedFiles];
+        $uploadedFiles = [];
+        $singleFile = $request->file('file');
+        if ($singleFile instanceof UploadedFile) {
+            $uploadedFiles[] = $singleFile;
         }
 
-        $uploadedFiles = array_filter($uploadedFiles, fn ($file) => $file instanceof UploadedFile);
+        $multipleFiles = $request->file('files', []);
+        if (! is_array($multipleFiles)) {
+            $multipleFiles = [$multipleFiles];
+        }
+
+        foreach ($multipleFiles as $file) {
+            if ($file instanceof UploadedFile) {
+                $uploadedFiles[] = $file;
+            }
+        }
 
         if ($uploadedFiles === []) {
-            return $this->validationErrorResponse(['files' => ['No files were provided.']]);
+            return $this->validationErrorResponse([
+                'file' => ['No file was provided.'],
+            ], Response::HTTP_BAD_REQUEST);
         }
 
         $disk = $this->disk();
+        $imageResize = new ImageResize($disk);
+
+        $variantDefinitions = [];
+        $variantErrors = [];
+
+        foreach (['small', 'medium', 'large'] as $variantKey) {
+            try {
+                $variantDefinitions[$variantKey] = $imageResize->resolveVariantSize($request->query($variantKey), $variantKey);
+            } catch (InvalidArgumentException $exception) {
+                $variantErrors[$variantKey] = [$exception->getMessage()];
+            }
+        }
+
+        if ($variantErrors !== []) {
+            return $this->validationErrorResponse($variantErrors, Response::HTTP_UNPROCESSABLE_ENTITY);
+        }
+
         $results = [];
 
         $finfo = new \finfo(FILEINFO_MIME_TYPE);
@@ -97,17 +128,15 @@ class AssetController extends Controller
             }
 
             $originalName = $file->getClientOriginalName();
-            $baseName = Str::slug(pathinfo($originalName, PATHINFO_FILENAME));
 
-            if ($baseName === '') {
-                $baseName = 'asset';
-            }
-
-            $extension = strtolower($file->getClientOriginalExtension());
-            $extension = preg_replace('/[^a-z0-9]/i', '', $extension ?? '') ?: $this->extensionFromMime($detectedMime) ?: 'bin';
-
-            $fileName = $this->uniqueFilename($disk, $folder, $baseName, $extension);
+            $fileName = $this->buildFileName($file, $detectedMime);
             $relativePath = ltrim(($folder ? $folder.'/' : '').$fileName, '/');
+
+            while ($disk->exists($relativePath)) {
+                usleep(1000);
+                $fileName = $this->buildFileName($file, $detectedMime);
+                $relativePath = ltrim(($folder ? $folder.'/' : '').$fileName, '/');
+            }
 
             $storedPath = $disk->putFileAs($folder ?? '', $file, $fileName);
 
@@ -129,7 +158,25 @@ class AssetController extends Controller
                 'uploaded_by' => $userId,
             ]);
 
-            $results[] = [
+            $variantResult = ['sizes' => [], 'metadata' => []];
+
+            try {
+                $variantResult = $imageResize->generateVariants($relativePath, $folder, $fileName, $variantDefinitions);
+            } catch (\Throwable $exception) {
+                return new JsonResponse([
+                    'message' => 'Failed to generate one or more image variants.',
+                ], Response::HTTP_INTERNAL_SERVER_ERROR);
+            }
+
+            $sizes = $variantResult['sizes'] ?? [];
+            $variantMetadata = $variantResult['metadata'] ?? [];
+
+            if ($variantMetadata !== []) {
+                $asset->generated_thumbs = array_merge((array) ($asset->generated_thumbs ?? []), $variantMetadata);
+                $asset->save();
+            }
+
+            $result = [
                 'id' => $asset->id,
                 'url' => $disk->url($relativePath),
                 'path' => $asset->path,
@@ -141,6 +188,12 @@ class AssetController extends Controller
                 'checksum' => $asset->checksum,
                 'created_at' => $asset->created_at,
             ];
+
+            if ($sizes !== []) {
+                $result['sizes'] = $sizes;
+            }
+
+            $results[] = $result;
         }
 
         return new JsonResponse(['data' => $results], Response::HTTP_CREATED);
@@ -315,27 +368,38 @@ class AssetController extends Controller
     }
 
     /**
-     * Build a unique filename for the asset.
+     * Build the filename for the original upload using slug + timestamp + extension.
      */
-    private function uniqueFilename(Filesystem|FilesystemAdapter $disk, ?string $folder, string $baseName, string $extension): string
+    private function buildFileName(UploadedFile $file, ?string $detectedMime = null): string
     {
-        do {
-            $candidate = sprintf('%s-%s.%s', $baseName, Str::lower(Str::random(8)), $extension);
-            $relativePath = ltrim(($folder ? $folder.'/' : '').$candidate, '/');
-        } while ($disk->exists($relativePath));
+        $originalName = $file->getClientOriginalName();
+        $baseName = Str::slug(pathinfo($originalName, PATHINFO_FILENAME));
 
-        return $candidate;
+        if ($baseName === '') {
+            $baseName = 'asset';
+        }
+
+        $extension = strtolower($file->getClientOriginalExtension() ?: '');
+        $extension = preg_replace('/[^a-z0-9]/i', '', $extension);
+
+        if ($extension === '') {
+            $extension = $this->extensionFromMime($detectedMime ?? $file->getMimeType()) ?? 'bin';
+        }
+
+        $timestamp = now()->format('YmdHisv'); // microsecond precision guards against collisions
+
+        return sprintf('%s-%s.%s', $baseName, $timestamp, $extension);
     }
 
     /**
      * Provide a consistent validation error response.
      */
-    private function validationErrorResponse(array $errors): JsonResponse
+    private function validationErrorResponse(array $errors, int $status = Response::HTTP_BAD_REQUEST): JsonResponse
     {
         return new JsonResponse([
             'message' => 'Validation failed.',
             'errors' => $errors,
-        ], Response::HTTP_BAD_REQUEST);
+        ], $status);
     }
 
     /**
